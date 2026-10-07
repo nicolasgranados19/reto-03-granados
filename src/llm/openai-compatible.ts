@@ -1,28 +1,75 @@
 import OpenAI from "openai"
+import { appendFileSync, mkdirSync } from "node:fs"
+import { join } from "node:path"
 import type { DefinicionHerramienta, LlmAdapter, Mensaje, RespuestaLlm } from "./adapter"
+
+type ClienteChat = { chat: { completions: { create: (cuerpo: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming, opciones?: { signal?: AbortSignal }) => Promise<OpenAI.Chat.ChatCompletion> } } }
+type Opciones = { cliente?: ClienteChat; dormir?: (ms: number) => Promise<void>; logPath?: string }
+
+const REINTENTOS_MAX = 4
+const BACKOFF_MS = [5000, 15000, 30000, 30000]
+const ESPERA_MAX_MS = 60000
+
+function cabecera(e: unknown, nombre: string): string | null {
+  const h = (e as { headers?: unknown }).headers
+  if (!h) return null
+  if (typeof (h as { get?: unknown }).get === "function") return (h as { get: (k: string) => string | null }).get(nombre)
+  const v = (h as Record<string, unknown>)[nombre]
+  return typeof v === "string" ? v : null
+}
+
+/** Espera ante un 429: retry-after-ms, retry-after (s), "try again in" del mensaje o backoff 5/15/30 s. */
+export function esperaPara429(e: unknown, reintento: number): number {
+  const ms = Number(cabecera(e, "retry-after-ms"))
+  if (Number.isFinite(ms) && ms > 0) return Math.min(ms, ESPERA_MAX_MS)
+  const seg = Number(cabecera(e, "retry-after"))
+  if (Number.isFinite(seg) && seg > 0) return Math.min(seg * 1000, ESPERA_MAX_MS)
+  return BACKOFF_MS[Math.min(reintento, BACKOFF_MS.length - 1)] ?? 30000
+}
 
 export class OpenAICompatible implements LlmAdapter {
   readonly proveedor: string
   readonly modelo: string
-  private cliente: OpenAI
+  /** Total de reintentos por 429 desde que arrancó el proceso (el loop lo usa para medir). */
+  reintentos = 0
+  private cliente: ClienteChat
   private timeoutMs: number
+  private dormir: (ms: number) => Promise<void>
+  private logPath: string
 
-  constructor(env: Record<string, string | undefined> = process.env) {
+  constructor(env: Record<string, string | undefined> = process.env, opciones: Opciones = {}) {
     this.proveedor = env.LLM_PROVIDER || "openai-compatible"
     this.modelo = env.LLM_MODEL || ""
     this.timeoutMs = Number(env.LLM_TIMEOUT_MS) || 30000
-    this.cliente = new OpenAI({ baseURL: env.LLM_BASE_URL || undefined, apiKey: env.LLM_API_KEY || "sin-clave", maxRetries: 0 })
+    this.cliente =
+      opciones.cliente ??
+      (new OpenAI({ baseURL: env.LLM_BASE_URL || undefined, apiKey: env.LLM_API_KEY || "sin-clave", maxRetries: 0 }) as unknown as ClienteChat)
+    this.dormir = opciones.dormir ?? ((ms) => new Promise((r) => setTimeout(r, ms)))
+    this.logPath = opciones.logPath ?? join(import.meta.dir, "..", "..", "out", "log.jsonl")
   }
 
-  /** Reintenta ante 429 esperando el tiempo que indica el proveedor (máx. 25 s por espera, 3 intentos). */
+  private registrarReintento(n: number, esperaMs: number) {
+    try {
+      mkdirSync(join(this.logPath, ".."), { recursive: true })
+      const resumen = `429 del proveedor: reintento ${n}/${REINTENTOS_MAX} en ${esperaMs} ms`
+      appendFileSync(this.logPath, JSON.stringify({ ts: new Date().toISOString(), sessionId: "llm", herramienta: "llm_reintento", ok: false, resumen }) + "\n")
+    } catch {
+      /* el log nunca rompe la llamada */
+    }
+  }
+
+  /** Reintenta hasta 4 veces ante 429. El timeout aplica a cada intento, no al total. */
   async enviar(mensajes: Mensaje[], herramientas: DefinicionHerramienta[]): Promise<RespuestaLlm> {
-    for (let intento = 1; ; intento++) {
+    for (let intento = 0; ; intento++) {
       try {
         return await this.enviarUna(mensajes, herramientas)
       } catch (e) {
-        const espera = (e as { esperaMs?: number }).esperaMs
-        if (espera === undefined || intento >= 3 || espera > 25000) throw e
-        await new Promise((r) => setTimeout(r, espera + 500))
+        const original = (e as { original429?: unknown }).original429
+        if (original === undefined || intento >= REINTENTOS_MAX) throw e
+        const espera = esperaPara429(original, intento)
+        this.reintentos++
+        this.registrarReintento(intento + 1, espera)
+        await this.dormir(espera)
       }
     }
   }
@@ -67,10 +114,7 @@ export class OpenAICompatible implements LlmAdapter {
       if (ac.signal.aborted) throw new Error(`El modelo no respondió en ${this.timeoutMs} ms (timeout).`)
       const status = (e as { status?: number }).status
       if (status === 429) {
-        const h = (e as { headers?: { get?: (k: string) => string | null } }).headers?.get?.("retry-after")
-        const m = e instanceof Error ? /try again in ([\d.]+)(ms|s)/i.exec(e.message) : null
-        const espera = h ? Number(h) * 1000 : m ? Number(m[1]) * (m[2] === "ms" ? 1 : 1000) : 5000
-        throw Object.assign(new Error("El proveedor del modelo rechazó la solicitud por límite de cuota (429). Intenta de nuevo en un momento o cambia LLM_MODEL."), { esperaMs: espera })
+        throw Object.assign(new Error("El proveedor del modelo rechazó la solicitud por límite de cuota (429). Intenta de nuevo en un momento o cambia LLM_MODEL."), { original429: e })
       }
       if (status === 401 || status === 403) throw new Error(`El proveedor del modelo rechazó las credenciales (${status}).`)
       throw new Error(`Error del proveedor del modelo${status ? ` (${status})` : ""}: ${e instanceof Error ? e.message.slice(0, 200) : "desconocido"}`)

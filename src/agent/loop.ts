@@ -12,6 +12,7 @@ export type Session = {
   messages: Mensaje[]
   toolCalls: ToolCallInfo[]
   tokens: number
+  tokensEntrada?: number
   creada: string
   needsConfirmation: boolean
 }
@@ -61,13 +62,21 @@ function persistir(s: Session) {
   }
 }
 
-function registrarLog(sessionId: string, herramienta: string, ok: boolean, resumen: string) {
+function registrarLog(sessionId: string, herramienta: string, ok: boolean, resumen: string, extra: Record<string, number> = {}) {
   try {
     mkdirSync(outDir(), { recursive: true })
     appendFileSync(join(outDir(), "log.jsonl"), JSON.stringify({ ts: new Date().toISOString(), sessionId, herramienta, ok, resumen }) + "\n")
   } catch {
     /* ignorar */
   }
+}
+
+export const MAX_CHARS_HERRAMIENTA = 1500
+
+/** Versión del resultado de una herramienta que se envía al modelo; el original queda en la sesión, el front y el log. */
+export function compactar(texto: string, max = MAX_CHARS_HERRAMIENTA): string {
+  return texto.length <= max ? texto : `${texto.slice(0, max)}
+[truncado: ${texto.length - max} caracteres]`
 }
 
 const CLAVES_CONFIRMACION = ["confirmaciones", "requiere_confirmacion", "campos_por_confirmar", "requiere_revision"]
@@ -118,6 +127,10 @@ export async function turno(llm: LlmAdapter, sessionId: string, mensaje: string)
   const delTurno: ToolCallInfo[] = []
   let necesita = false
   let reply = ""
+  let iteraciones = 0
+  const tokens0 = s.tokens
+  const entrada0 = s.tokensEntrada ?? 0
+  const reintentos0 = (llm as { reintentos?: number }).reintentos ?? 0
 
   try {
     for (let i = 0; i < maxIter; i++) {
@@ -126,8 +139,10 @@ export async function turno(llm: LlmAdapter, sessionId: string, mensaje: string)
         s.messages.push({ role: "assistant", content: reply })
         break
       }
+      iteraciones++
       const r = await llm.enviar(s.messages, definiciones())
       s.tokens += r.tokens.entrada + r.tokens.salida
+      s.tokensEntrada = (s.tokensEntrada ?? 0) + r.tokens.entrada
       s.messages.push({ role: "assistant", content: r.texto, ...(r.llamadas.length ? { toolCalls: r.llamadas } : {}) })
       if (!r.llamadas.length) {
         reply = r.texto
@@ -151,12 +166,13 @@ export async function turno(llm: LlmAdapter, sessionId: string, mensaje: string)
         delTurno.push(info)
         s.toolCalls.push(info)
         registrarLog(sessionId, c.nombre, a.ok, a.resumen)
-        s.messages.push({ role: "tool", content: texto, toolCallId: c.id, name: c.nombre })
+        s.messages.push({ role: "tool", content: compactar(texto), toolCallId: c.id, name: c.nombre })
       }
       if (i === maxIter - 1) {
         s.messages.push({ role: "user", content: "[sistema] Se alcanzó el tope de iteraciones. Responde ahora con lo que tienes y lo que falta." })
         const f = await llm.enviar(s.messages, [])
         s.tokens += f.tokens.entrada + f.tokens.salida
+        s.tokensEntrada = (s.tokensEntrada ?? 0) + f.tokens.entrada
         reply = f.texto || "Se alcanzó el tope de iteraciones antes de terminar."
         s.messages.push({ role: "assistant", content: reply })
       }
@@ -166,6 +182,12 @@ export async function turno(llm: LlmAdapter, sessionId: string, mensaje: string)
     s.messages.push({ role: "assistant", content: reply })
   }
   s.needsConfirmation = necesita
+  const entrada = (s.tokensEntrada ?? 0) - entrada0
+  const total = s.tokens - tokens0
+  const reintentos = ((llm as { reintentos?: number }).reintentos ?? 0) - reintentos0
+  registrarLog(sessionId, "turno", true, `tokens entrada=${entrada} salida=${total - entrada} total=${total}; iteraciones=${iteraciones}; reintentos=${reintentos}`, {
+    tokens_entrada: entrada, tokens_salida: total - entrada, iteraciones, reintentos,
+  })
   persistir(s)
   return { reply, toolCalls: delTurno.map(({ resultado: _r, ...x }) => x), needsConfirmation: necesita }
 }
