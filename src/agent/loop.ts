@@ -70,7 +70,22 @@ function registrarLog(sessionId: string, herramienta: string, ok: boolean, resum
   }
 }
 
-function analizar(texto: string): { ok: boolean; resumen: string; pide: boolean; parsed: unknown } {
+const CLAVES_CONFIRMACION = ["confirmaciones", "requiere_confirmacion", "campos_por_confirmar", "requiere_revision"]
+
+/** true si algún nivel del resultado trae campos por confirmar (lista no vacía o estado requiere_confirmacion). */
+function hayPorConfirmar(v: unknown, profundidad = 0): boolean {
+  if (profundidad > 6 || v === null || typeof v !== "object") return false
+  if (Array.isArray(v)) return v.some((x) => hayPorConfirmar(x, profundidad + 1))
+  const o = v as Record<string, unknown>
+  if (o.estado === "requiere_confirmacion") return true
+  for (const [k, x] of Object.entries(o)) {
+    if (CLAVES_CONFIRMACION.includes(k) && Array.isArray(x) && x.length > 0) return true
+    if (hayPorConfirmar(x, profundidad + 1)) return true
+  }
+  return false
+}
+
+export function analizar(texto: string): { ok: boolean; resumen: string; pide: boolean; parsed: unknown } {
   try {
     const p = JSON.parse(texto) as { ok?: boolean; error?: string; data?: Record<string, unknown> }
     if (p.ok === false) {
@@ -84,7 +99,7 @@ function analizar(texto: string): { ok: boolean; resumen: string; pide: boolean;
       .slice(0, 6)
       .map(([k, v]) => `${k}=${typeof v === "object" && v !== null ? (Array.isArray(v) ? `[${v.length}]` : "{…}") : String(v).slice(0, 40)}`)
       .join(", ")
-    return { ok: true, resumen: resumen.slice(0, 300) || "ok", pide: conf > 0 || pendiente, parsed: p }
+    return { ok: true, resumen: resumen.slice(0, 300) || "ok", pide: conf > 0 || pendiente || hayPorConfirmar(d), parsed: p }
   } catch {
     return { ok: true, resumen: texto.slice(0, 200), pide: false, parsed: texto }
   }
