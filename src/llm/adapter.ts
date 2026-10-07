@@ -1,4 +1,5 @@
-export type LlamadaHerramienta = { id: string; nombre: string; argumentos: string }
+/** `extra`: dato opaco del proveedor (p. ej. thought_signature de Gemini); se guarda y se reenvía sin tocarlo. */
+export type LlamadaHerramienta = { id: string; nombre: string; argumentos: string; extra?: Record<string, unknown> }
 export type Mensaje = {
   role: "system" | "user" | "assistant" | "tool"
   content: string

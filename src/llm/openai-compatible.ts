@@ -27,6 +27,12 @@ export function esperaPara429(e: unknown, reintento: number): number {
   return BACKOFF_MS[Math.min(reintento, BACKOFF_MS.length - 1)] ?? 30000
 }
 
+/** `extra_content` del tool_call tal cual lo mandó el proveedor (Gemini: google.thought_signature). Se guarda bajo su propia clave para reenviarlo sin cambios. */
+function extraDe(c: unknown): Record<string, unknown> | undefined {
+  const ec = (c as { extra_content?: unknown }).extra_content
+  return ec === undefined || ec === null ? undefined : { extra_content: ec }
+}
+
 export class OpenAICompatible implements LlmAdapter {
   readonly proveedor: string
   readonly modelo: string
@@ -34,6 +40,7 @@ export class OpenAICompatible implements LlmAdapter {
   reintentos = 0
   private cliente: ClienteChat
   private timeoutMs: number
+  private clave: string
   private dormir: (ms: number) => Promise<void>
   private logPath: string
 
@@ -41,11 +48,25 @@ export class OpenAICompatible implements LlmAdapter {
     this.proveedor = env.LLM_PROVIDER || "openai-compatible"
     this.modelo = env.LLM_MODEL || ""
     this.timeoutMs = Number(env.LLM_TIMEOUT_MS) || 30000
+    this.clave = env.LLM_API_KEY ?? ""
     this.cliente =
       opciones.cliente ??
       (new OpenAI({ baseURL: env.LLM_BASE_URL || undefined, apiKey: env.LLM_API_KEY || "sin-clave", maxRetries: 0 }) as unknown as ClienteChat)
     this.dormir = opciones.dormir ?? ((ms) => new Promise((r) => setTimeout(r, ms)))
     this.logPath = opciones.logPath ?? join(import.meta.dir, "..", "..", "out", "log.jsonl")
+  }
+
+  /** Registra el mensaje de error del proveedor ante 4xx (sin la clave) para diagnosticar límites o validaciones. */
+  private registrarErrorProveedor(status: number, e: unknown) {
+    try {
+      let msg = e instanceof Error ? e.message : String(e)
+      if (this.clave) msg = msg.split(this.clave).join("***")
+      msg = msg.replace(/(Bearer\s+)[\w.\-]+/gi, "$1***").slice(0, 600)
+      mkdirSync(join(this.logPath, ".."), { recursive: true })
+      appendFileSync(this.logPath, JSON.stringify({ ts: new Date().toISOString(), sessionId: "llm", herramienta: "llm_error", ok: false, resumen: `HTTP ${status}: ${msg}` }) + "\n")
+    } catch {
+      /* el log nunca rompe la llamada */
+    }
   }
 
   private registrarReintento(n: number, esperaMs: number) {
@@ -85,7 +106,14 @@ export class OpenAICompatible implements LlmAdapter {
             role: "assistant",
             content: m.content || null,
             ...(m.toolCalls?.length
-              ? { tool_calls: m.toolCalls.map((c) => ({ id: c.id, type: "function" as const, function: { name: c.nombre, arguments: c.argumentos } })) }
+              ? {
+                  tool_calls: m.toolCalls.map((c) => ({
+                    id: c.id,
+                    type: "function" as const,
+                    function: { name: c.nombre, arguments: c.argumentos },
+                    ...(c.extra ? c.extra : {}),
+                  })),
+                }
               : {}),
           }
         }
@@ -103,7 +131,14 @@ export class OpenAICompatible implements LlmAdapter {
       )
       const msg = r.choices[0]?.message
       const llamadas = (msg?.tool_calls ?? []).flatMap((c) =>
-        c.type === "function" ? [{ id: c.id, nombre: c.function.name, argumentos: c.function.arguments || "{}" }] : [],
+        c.type === "function"
+          ? [{
+              id: c.id,
+              nombre: c.function.name,
+              argumentos: c.function.arguments || "{}",
+              ...(extraDe(c) ? { extra: extraDe(c) } : {}),
+            }]
+          : [],
       )
       return {
         texto: msg?.content ?? "",
@@ -113,6 +148,7 @@ export class OpenAICompatible implements LlmAdapter {
     } catch (e) {
       if (ac.signal.aborted) throw new Error(`El modelo no respondió en ${this.timeoutMs} ms (timeout).`)
       const status = (e as { status?: number }).status
+      if (typeof status === "number" && status >= 400 && status < 500) this.registrarErrorProveedor(status, e)
       if (status === 429) {
         throw Object.assign(new Error("El proveedor del modelo rechazó la solicitud por límite de cuota (429). Intenta de nuevo en un momento o cambia LLM_MODEL."), { original429: e })
       }

@@ -27,7 +27,7 @@ describe("reintento ante 429", () => {
     expect(t.llamadas()).toBe(3)
     expect(t.esperas).toEqual([1200, 3000])
     expect(t.llm.reintentos).toBe(2)
-    const lineas = readFileSync(t.logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l))
+    const lineas = readFileSync(t.logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l)).filter((l) => l.herramienta === "llm_reintento")
     expect(lineas.length).toBe(2)
     expect(lineas[0].resumen).toContain("reintento 1/4")
   })
